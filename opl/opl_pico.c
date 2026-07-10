@@ -118,7 +118,7 @@ static inline void Pico_UnlockMutex(mutex_t *mutex) {
 // Advance time by the specified number of samples, invoking any
 // callback functions as appropriate.
 
-static void AdvanceTime(unsigned int nsamples)
+static void __not_in_flash_func(AdvanceTime)(unsigned int nsamples)
 {
     opl_callback_t callback;
     void *callback_data;
@@ -183,11 +183,17 @@ extern void TrackTimerCallback(void *track);
 extern uint8_t restart_song_state;
 #endif
 
-void OPL_Pico_Mix_callback(audio_buffer_t *audio_buffer)
+// SCRATCH_X, not flash: runs every 3 ms from the timer pump; see the
+// matching comment on I_Pico_UpdateSound in i_picosound.c.
+void __scratch_x("snd_mix") OPL_Pico_Mix_callback(audio_buffer_t *audio_buffer)
 {
     unsigned int filled, buffer_samples;
 #if DOOM_TINY
-    if (restart_song_state == 2) {
+    // Deferred song restart: main-loop mixes only. The timer-driven pump
+    // also reaches this callback from IRQ context, where RestartSong's
+    // stack depth is not welcome (same reason pd_render defers it around
+    // its deep render-loop SafeUpdateSound calls).
+    if (restart_song_state == 2 && !__get_current_exception()) {
         RestartSong(0);
     }
 #endif
@@ -457,14 +463,17 @@ static void OPL_Pico_ClearCallbacks(void)
     Pico_UnlockMutex(&callback_queue_mutex);
 }
 
+// Historically no-ops (everything ran in the main loop). Now that the
+// hardware-timer audio pump can run the OPL mix from IRQ context, the lock
+// must actually inhibit it: wire to i_picosound's counting pump lock.
 static void OPL_Pico_Lock(void)
 {
-    Pico_LockMutex(&callback_mutex);
+    I_PicoSoundLock();
 }
 
 static void OPL_Pico_Unlock(void)
 {
-    Pico_UnlockMutex(&callback_mutex);
+    I_PicoSoundUnlock();
 }
 
 static void OPL_Pico_SetPaused(int paused)

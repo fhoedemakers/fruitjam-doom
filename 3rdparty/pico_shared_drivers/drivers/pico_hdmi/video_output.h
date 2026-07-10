@@ -156,4 +156,12 @@ void video_output_request_resync(void);
 
 int get_video_output_resync_count(void);
 
+/**
+ * Number of scanout DMA IRQs that arrived more than one block late since
+ * boot (both ping and pong completions pending on entry). Each such event
+ * means one silently corrupted output line — no watchdog/resync catches it.
+ * Monotonic; diff between reads.
+ */
+uint32_t video_output_get_late_irq_count(void);
+
 #endif // VIDEO_OUTPUT_H

@@ -50,6 +50,11 @@ if (NOT TARGET pico_hdmi)
         # underrun counter stays frozen through gameplay; at 96 it grew by
         # ~2400/s. Re-enable HSTX_DEBUG=1 here to get the 1 Hz UART dump of
         # frames/s, irqs/s, resyncs, DI level and underrun count.)
+        # (HSTX_DEBUG=1 deliberately NOT set: its ~130-char core1 dump holds
+        # the stdio mutex ~11 ms at 115200 baud. Everything it reported is
+        # available cheaper in the 1 Hz core0 "SND" line in i_picosound.c —
+        # DI level/underruns via the queue getters, resyncs via
+        # get_video_output_resync_count().)
         target_compile_definitions(pico_hdmi INTERFACE
                     DI_RING_BUFFER_SIZE=256
                     HSTX_AUDIO_DI_HIGH_WATERMARK=224

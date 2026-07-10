@@ -79,6 +79,9 @@ void audio_i2s_enqueue_sample(uint32_t sample32);
 enum headphone_toggle_t audio_i2s_poll_headphone_status();
 int audio_i2s_get_freebuffer_size();
 int audio_i2s_get_fill_permille();
+// Number of times the DMA drained the ring dry since boot (output stalls
+// until the producer refills). Monotonic; diff between reads.
+uint32_t audio_i2s_get_underrun_count(void);
 void audio_i2s_disable() ;
 bool audio_i2s_dacError();
 void audio_i2s_muteInternalSpeaker(bool mute);

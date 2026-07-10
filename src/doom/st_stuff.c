@@ -291,7 +291,9 @@ cheatseq_t cheat_ammonokey = CHEAT("idfa", 0);
 cheatseq_t cheat_noclip = CHEAT("idspispopd", 0);
 cheatseq_t cheat_commercial_noclip = CHEAT("idclip", 0);
 #if USE_FPS
-boolean show_fps;//=1;
+// Default ON: the Fruit Jam is often driven gamepad-only, with no keyboard
+// to hit the backslash toggle (see G_Responder).
+boolean show_fps = true;
 #endif
 
 cheatseq_t	cheat_powerup[7] =

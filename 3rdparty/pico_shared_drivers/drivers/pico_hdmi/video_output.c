@@ -414,11 +414,27 @@ static inline void __not_in_flash_func(video_output_handle_active_data)(dma_chan
 // DMA IRQ Handler
 // ============================================================================
 
+// Diagnostic: counts IRQ entries where BOTH ping and pong completions are
+// already pending — i.e. this handler is more than one DMA block late, the
+// un-rearmed partner channel was chain-retriggered with a stale READ_ADDR,
+// and one corrupted line went out. No watchdog catches this (the frame
+// counter keeps advancing), so it is otherwise silent.
+static volatile uint32_t late_irq_count;
+
+uint32_t video_output_get_late_irq_count(void)
+{
+    return late_irq_count;
+}
+
 void __not_in_flash_func(dma_irq_handler)(void)
 {
     #if HSTX_DEBUG
     irq_count++;
     #endif
+    if ((dma_hw->ints0 & ((1u << DMACH_PING) | (1u << DMACH_PONG)))
+            == ((1u << DMACH_PING) | (1u << DMACH_PONG))) {
+        late_irq_count++;
+    }
     uint32_t ch_num = dma_pong ? DMACH_PONG : DMACH_PING;
     dma_channel_hw_t *ch = &dma_hw->ch[ch_num];
     dma_hw->intr = 1U << ch_num;

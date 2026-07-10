@@ -20,6 +20,7 @@
 
 #include "config.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <assert.h>
 #include <doom/sounds.h>
@@ -39,6 +40,8 @@
 #include "pico/audio.h"
 #include "pico/binary_info.h"
 #include "hardware/gpio.h"
+#include "hardware/timer.h"
+#include "hardware/irq.h"
 
 #include "audio_i2s.h"                 // pico_shared: audio_i2s_setup / enqueue / mute
 #include "tlv320dac3100.h"             // enum headphone_toggle_t
@@ -166,7 +169,7 @@ static bool check_and_init_channel(int channel) {
     return sound_initialized && ((uint)channel) < NUM_SOUND_CHANNELS;
 }
 
-int adpcm_decode_block_s8(int8_t *outbuf, const uint8_t *inbuf, int inbufsize)
+int __not_in_flash_func(adpcm_decode_block_s8)(int8_t *outbuf, const uint8_t *inbuf, int inbufsize)
 {
 #if 1
     int samples = 1, chunks;
@@ -232,7 +235,7 @@ int adpcm_decode_block_s8(int8_t *outbuf, const uint8_t *inbuf, int inbufsize)
 #endif
 }
 
-static void decompress_buffer(channel_t *channel) {
+static void __not_in_flash_func(decompress_buffer)(channel_t *channel) {
     if (channel->data == channel->data_end) {
         channel->decompressed_size = 0;
     } else {
@@ -346,12 +349,17 @@ static int I_Pico_StartSound(should_be_const sfxinfo_t *sfxinfo, int channel, in
 {
     if (!check_and_init_channel(channel)) return -1;
 
+    // Hold the pump lock: init_channel_for_sfx makes the channel "playing"
+    // (decompressed_size != 0) before offset is reset, and a timer-ISR mix
+    // arriving in that window would read a half-initialized channel.
+    I_PicoSoundLock();
     stop_channel(channel);
     channel_t *ch = &channels[channel];
     if (!init_channel_for_sfx(ch, sfxinfo, pitch)) {
         assert(!is_channel_playing(channel)); // don't expect to have to mark it sotpped
     }
     I_Pico_UpdateSoundParams(channel, vol, sep);
+    I_PicoSoundUnlock();
     return channel;
 }
 
@@ -368,21 +376,134 @@ static boolean I_Pico_SoundIsPlaying(int channel)
     return is_channel_playing(channel);
 }
 
-static void I_Pico_UpdateSound(void)
+// ---------------------------------------------------------------------------
+// Audio pump.
+//
+// Historically the mixer only ran when the core0 game/render loop reached an
+// I_UpdateSound() call site (pd_end_frame's vsync spin, r_bsp's 3 ms hook,
+// S_UpdateSounds once per frame). A heavy render frame opens >16 ms with no
+// mixing at all, which drains the I2S ring (~16 ms of usable headroom — the
+// gate below keeps 256 of 1024 samples free) and the HDMI DI ring (~18.7 ms).
+// Underrun samples are queued late, never dropped, so every gap permanently
+// stretches the audio timeline — audible as the music tempo dragging.
+//
+// Fix: a hardware-timer IRQ on core0 also calls I_Pico_UpdateSound() every
+// SND_PUMP_INTERVAL_US, so mixing no longer depends on where the render loop
+// happens to be. The main-loop call sites remain as opportunistic top-ups.
+//
+// Concurrency (everything is on core0, so a counting flag is sufficient —
+// an ISR runs to completion and cannot interleave with thread code):
+//  - a main-loop mix holds snd_audio_lock for its duration; the timer ISR
+//    sees it and skips.
+//  - control paths that mutate mixer/OPL state also hold it: see
+//    I_Pico_StartSound below, OPL_Pico_Lock/Unlock in opl/opl_pico.c and the
+//    OPL_Lock() sites in i_oplmusic.c.
+//  - an ISR mix must not do blocking I2C (doom_poll_headphone), printf, or
+//    RestartSong (stack depth) — all three are gated to main-loop calls.
+static volatile uint8_t snd_audio_lock;
+
+void I_PicoSoundLock(void) { snd_audio_lock++; }
+void I_PicoSoundUnlock(void) { snd_audio_lock--; }
+
+// 1 Hz pump diagnostics, printed from main-loop pumps only ("SND ..."):
+//   m      successful MIX_CHUNK_SAMPLES mixes (48000/256 = 187.5/s when
+//          healthy; lower means the audio timeline is being stretched)
+//   g      max µs between mix completions (>16000 risks I2S underrun,
+//          >18700 risks HDMI DI underrun)
+//   sI/sD  calls skipped by the I2S-full / DI-full back-pressure gates
+//          (large values are GOOD - the pump has spare capacity)
+//   mx/mu  max single mix µs / total mix µs in the window (OPL cost)
+//   uI/uD  I2S / HDMI-DI underrun events in the window (healthy: 0)
+//   dl     HDMI DI queue level snapshot
+//   bg     core1 background-task max µs (see pico_hdmi_glue.c)
+//   rs     HSTX auto-resync count since boot (healthy: 0)
+//   lt     scanout DMA IRQs >1 block late in the window — each one is a
+//          silently corrupted output LINE (video_output.c)
+//   br     scanline-callback reads that overtook the bg-task fill — stale
+//          rows, i.e. tearing (i_video.c doom_bg_rows_done)
+//
+// The ~85-char line costs ~7 ms of UART at 115200 once a second, on the
+// main loop only. That is tolerable precisely because of the timer pump:
+// the lock is dropped before the printf, so the ISR keeps mixing while the
+// main loop drains the UART FIFO. (Core1 prints nothing during gameplay —
+// keep pico_hdmi's HSTX_DEBUG off, its dump would hold the stdio mutex.)
+static uint32_t snd_stat_win_start_us, snd_stat_last_mix_us;
+static uint32_t snd_stat_max_gap_us, snd_stat_mix_count;
+static uint32_t snd_stat_skip_i2s, snd_stat_skip_di;
+static uint32_t snd_stat_max_mix_us, snd_stat_total_mix_us;
+static uint32_t snd_stat_prev_underrun_i2s, snd_stat_prev_underrun_di;
+static uint32_t snd_stat_prev_late_irq, snd_stat_prev_bg_race;
+extern volatile uint32_t doom_bg_race_count;   // i_video.c
+
+static void I_Pico_UpdateSound(void);
+
+// Raw hardware alarm rather than a repeating_timer: the build sets
+// PICO_TIME_DEFAULT_ALARM_POOL_DISABLED=1 (src/CMakeLists.txt), so alarm 3 —
+// the alarm the default pool would have claimed — is free, and there is no
+// alarm-pool machinery between the tick and the mix.
+#define SND_PUMP_ALARM_NUM 3
+#define SND_PUMP_INTERVAL_US 3000
+
+static void __not_in_flash_func(snd_pump_irq_handler)(void)
+{
+    timer_hw->intr = 1u << SND_PUMP_ALARM_NUM;   // ack
+    timer_hw->alarm[SND_PUMP_ALARM_NUM] = timer_hw->timerawl + SND_PUMP_INTERVAL_US;
+    I_Pico_UpdateSound();
+}
+
+// Started lazily from the first MAIN-LOOP pump, not from I_Pico_InitSound():
+// sound init runs before I_InitGraphics/doom_hdmi_init (see d_main.c), and
+// the ISR must not push into the HDMI DI ring before hstx_di_queue_init().
+// Main-loop pumps all originate from D_DoomLoop, which starts after graphics
+// init, so first-call ordering is guaranteed.
+static void snd_pump_timer_start(void)
+{
+    hardware_alarm_claim(SND_PUMP_ALARM_NUM);
+    uint irq = hardware_alarm_get_irq_num(SND_PUMP_ALARM_NUM);
+    irq_set_exclusive_handler(irq, snd_pump_irq_handler);
+    // Lowest priority: a 1-3 ms OPL mix in this IRQ must never delay the I2S
+    // ring refill (DMA_IRQ_1), USB, or anything else at default priority.
+    irq_set_priority(irq, PICO_LOWEST_IRQ_PRIORITY);
+    hw_set_bits(&timer_hw->inte, 1u << SND_PUMP_ALARM_NUM);
+    timer_hw->alarm[SND_PUMP_ALARM_NUM] = timer_hw->timerawl + SND_PUMP_INTERVAL_US;
+    irq_set_enabled(irq, true);
+}
+
+// In SCRATCH_X, not flash: the timer pump runs this every 3 ms across the
+// whole frame, and its XIP fetches raised core0's QSPI duty enough to add
+// TMDS bit errors (whole-screen pixel sparkles) on the marginal HDMI link
+// during heavy scenes. SCRATCH_X has ~2.5 KB free (core1 runs on its own
+// static stack, so the default core1-stack reservation there is unused)
+// and costs no zone bytes. Same for OPL_Pico_Mix_callback and
+// OPL_calc_buffer_linear.
+static void __scratch_x("snd_mix") I_Pico_UpdateSound(void)
 {
     if (!sound_initialized) return;
 
-    // Poll headphone-detect (cheap; short-circuits if no IRQ latched). Runs
-    // here rather than from a timer so it stays on core0, where the TLV320
-    // register writes and speaker-mute path are safe to do.
-    doom_poll_headphone();
+    bool in_irq = __get_current_exception() != 0;
+    if (in_irq) {
+        // Timer-ISR pump: the main loop is mid-mix or inside a mixer/OPL
+        // critical section — it will produce the samples itself.
+        if (snd_audio_lock) return;
+    } else {
+        static bool pump_started;
+        if (!pump_started) {
+            pump_started = true;
+            snd_pump_timer_start();
+        }
+        // Poll headphone-detect (cheap; short-circuits if no IRQ latched).
+        // Blocking TLV320 I2C register writes — main-loop calls only.
+        doom_poll_headphone();
+        snd_audio_lock++;   // timer ISR skips while we're in here
+    }
 
     // Back-pressure: don't mix if the I2S ring is too full — the extra
     // samples would just drop in audio_i2s_enqueue_sample(). Keep ~half the
     // ring free so a burst of writes doesn't cause underflow if we get
     // preempted.
     if (audio_i2s_get_freebuffer_size() < MIX_CHUNK_SAMPLES) {
-        return;
+        snd_stat_skip_i2s++;
+        goto done;
     }
 
     // HDMI DI-ring back-pressure: pd_end_frame() busy-loops calling
@@ -395,9 +516,15 @@ static void I_Pico_UpdateSound(void)
     if (doom_audio_sink == DOOM_SINK_HDMI) {
         const uint32_t di_burst_packets = MIX_CHUNK_SAMPLES / 4;
         if (hstx_di_queue_get_level() + di_burst_packets > HSTX_AUDIO_DI_HIGH_WATERMARK) {
-            return;
+            snd_stat_skip_di++;
+            goto done;
         }
     }
+
+    {
+    uint32_t mix_t0 = time_us_32();
+    uint32_t gap = mix_t0 - snd_stat_last_mix_us;
+    if (gap > snd_stat_max_gap_us) snd_stat_max_gap_us = gap;
 
     audio_buffer_t *buffer = &mix_audio_buffer;
     if (music_generator) {
@@ -496,6 +623,55 @@ static void I_Pico_UpdateSound(void)
             int16_t r = *sp++;
             hstx_push_audio_sample((int)l, (int)r);
             audio_i2s_enqueue_sample(0);
+        }
+    }
+
+    uint32_t mix_t1 = time_us_32();
+    snd_stat_last_mix_us = mix_t1;
+    uint32_t mix_dur = mix_t1 - mix_t0;
+    if (mix_dur > snd_stat_max_mix_us) snd_stat_max_mix_us = mix_dur;
+    snd_stat_total_mix_us += mix_dur;
+    snd_stat_mix_count++;
+    }
+
+done:
+    if (!in_irq) {
+        snd_audio_lock--;
+        // 1 Hz stats line (field legend at the snd_stat_* declarations).
+        // printf holds the stdio mutex — main-loop context only.
+        uint32_t now = time_us_32();
+        if (now - snd_stat_win_start_us >= 1000000u) {
+            uint32_t under_i2s = audio_i2s_get_underrun_count();
+            uint32_t under_di = hstx_di_queue_get_underrun_count();
+            uint32_t late_irq = video_output_get_late_irq_count();
+            uint32_t bg_race = doom_bg_race_count;
+            uint32_t bg = doom_bg_task_max_us;
+            doom_bg_task_max_us = 0;
+            printf("SND m=%lu g=%lu sI=%lu sD=%lu mx=%lu mu=%lu uI=%lu uD=%lu dl=%lu bg=%lu rs=%d lt=%lu br=%lu\n",
+                   (unsigned long)snd_stat_mix_count,
+                   (unsigned long)snd_stat_max_gap_us,
+                   (unsigned long)snd_stat_skip_i2s,
+                   (unsigned long)snd_stat_skip_di,
+                   (unsigned long)snd_stat_max_mix_us,
+                   (unsigned long)snd_stat_total_mix_us,
+                   (unsigned long)(under_i2s - snd_stat_prev_underrun_i2s),
+                   (unsigned long)(under_di - snd_stat_prev_underrun_di),
+                   (unsigned long)hstx_di_queue_get_level(),
+                   (unsigned long)bg,
+                   get_video_output_resync_count(),
+                   (unsigned long)(late_irq - snd_stat_prev_late_irq),
+                   (unsigned long)(bg_race - snd_stat_prev_bg_race));
+            snd_stat_prev_underrun_i2s = under_i2s;
+            snd_stat_prev_underrun_di = under_di;
+            snd_stat_prev_late_irq = late_irq;
+            snd_stat_prev_bg_race = bg_race;
+            snd_stat_mix_count = snd_stat_max_gap_us = 0;
+            snd_stat_skip_i2s = snd_stat_skip_di = 0;
+            snd_stat_max_mix_us = snd_stat_total_mix_us = 0;
+            // Re-stamp after the print so its UART time is excluded from the
+            // next window's gap measurement.
+            snd_stat_win_start_us = time_us_32();
+            snd_stat_last_mix_us = snd_stat_win_start_us;
         }
     }
 }

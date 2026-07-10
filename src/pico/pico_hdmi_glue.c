@@ -34,6 +34,24 @@ volatile doom_audio_sink_t doom_audio_sink = DOOM_SINK_HDMI;
 // pico_shared/pico_hdmi upstream default).
 static uint32_t doom_hdmi_core1_stack[1024] __attribute__((aligned(8)));
 
+// Diagnostic: max duration of one core1 background-task invocation (palette
+// conversion + overlay compositing) in the current stats window. Written by
+// core1, read-and-reset by core0's 1 Hz "SND" line in i_picosound.c — the
+// unsynchronized read/reset is a benign race for a max diagnostic. A value
+// approaching 16700 µs means the bg task no longer fits a 60 Hz frame.
+volatile uint32_t doom_bg_task_max_us;
+static video_output_task_fn doom_real_bg_task;
+
+static void doom_timed_bg_task(void)
+{
+    uint32_t t0 = time_us_32();
+    doom_real_bg_task();
+    uint32_t d = time_us_32() - t0;
+    if (d > doom_bg_task_max_us) {
+        doom_bg_task_max_us = d;
+    }
+}
+
 void doom_hdmi_init(video_output_scanline_cb_t scanline_cb,
                     video_output_vsync_cb_t vsync_cb,
                     video_output_task_fn bg_task,
@@ -62,7 +80,8 @@ void doom_hdmi_init(video_output_scanline_cb_t scanline_cb,
         video_output_set_vsync_callback(vsync_cb);
     }
     if (bg_task) {
-        video_output_set_background_task(bg_task);
+        doom_real_bg_task = bg_task;
+        video_output_set_background_task(doom_timed_bg_task);
     }
     video_output_init(640, 480);
     pico_hdmi_set_audio_sample_rate(audio_sample_rate);

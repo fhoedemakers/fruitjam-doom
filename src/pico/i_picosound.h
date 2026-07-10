@@ -44,4 +44,12 @@ void I_PicoSoundSetMusicGenerator(void (*generator)(audio_buffer_t *buffer));
 bool I_PicoSoundIsInitialized(void);
 void I_PicoSoundFade(bool in);
 bool I_PicoSoundFading(void);
+
+// Counting lock over the mixer/OPL state. While held, the hardware-timer
+// audio pump (i_picosound.c) skips its mix, so main-loop code can safely
+// mutate channel or OPL state. Nesting-safe; main-loop (thread) context
+// only — the pump ISR itself never blocks on it, it just yields.
+// opl/opl_pico.c wires OPL_Lock()/OPL_Unlock() to these.
+void I_PicoSoundLock(void);
+void I_PicoSoundUnlock(void);
 #endif

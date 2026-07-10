@@ -31,6 +31,11 @@ typedef enum {
 
 extern volatile doom_audio_sink_t doom_audio_sink;
 
+// Diagnostic: max µs one core1 background-task invocation took in the
+// current window. Written by core1 (pico_hdmi_glue.c wraps the registered
+// bg task), read-and-reset by the 1 Hz "SND" stats line on core0.
+extern volatile uint32_t doom_bg_task_max_us;
+
 // Bring up HSTX video + HDMI audio data-island stream. Registers
 // `scanline_cb` and `vsync_cb` (both invoked from DMA_IRQ_0 on core1) plus
 // `bg_task` (invoked from core1's main loop between DMA IRQs — safe to do

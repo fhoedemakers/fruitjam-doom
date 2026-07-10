@@ -95,6 +95,8 @@ void audio_i2s_out_32(uint32_t sample32)
  * updates the read index to point to the next block of audio data, and checks if there
  * is enough data available in the ring buffer to continue the DMA transfer.
  */
+static volatile uint32_t i2s_underrun_count = 0;
+
 void __isr dma_handler()
 {
 	// Clear the interrupt
@@ -110,6 +112,19 @@ void __isr dma_handler()
 		dma_channel_set_read_addr(audio_i2s.dma_chan, &audio_ring[read_index], false);
 		dma_channel_set_trans_count(audio_i2s.dma_chan, DMA_BLOCK_SIZE, true); // true = start immediately
 	}
+	else
+	{
+		// Ring starved: output stalls after the in-flight block until
+		// audio_i2s_enqueue_sample() restarts the DMA. Counts stall events,
+		// not stalled duration. Monotonic; diff between reads (mirrors
+		// hstx_di_queue_get_underrun_count in pico_hdmi).
+		i2s_underrun_count++;
+	}
+}
+
+uint32_t audio_i2s_get_underrun_count(void)
+{
+	return i2s_underrun_count;
 }
 
 /**

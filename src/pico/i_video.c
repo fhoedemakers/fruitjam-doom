@@ -1076,10 +1076,23 @@ void __not_in_flash_func(doom_hstx_vsync_cb)(void) {
 // if PLAYPAL wasn't pre-warmed) are safe. Fires once per vsync — we clear
 // the flag before doing the work so a vsync arriving mid-fill just marks
 // the next frame as pending and we catch up naturally.
+// Bg-task fill progress vs. the scanout beam. rows_done is published per
+// row by the bg task (core1 main loop) and compared by the scanline
+// callback (core1 IRQ) — same core, so ordering is program order. The race
+// counter is read-and-reset by core0's 1 Hz "SND" line (benign race).
+// Starts at DOOM_RGB_FB_ROWS: before the first fill, and between fills,
+// every row legitimately holds the last completed frame.
+volatile uint16_t doom_bg_rows_done = DOOM_RGB_FB_ROWS;
+volatile uint32_t doom_bg_race_count;
+
 void __not_in_flash_func(doom_hstx_bg_task)(void) {
     if (!doom_fb_fill_pending) return;
     doom_fb_fill_pending = false;
 
+    // Zero the progress marker BEFORE new_frame_stuff: its flash-resident
+    // overlay/palette init is the likeliest front-loaded stall, and beam
+    // reads during that window are already stale for the new frame.
+    doom_bg_rows_done = 0;
     new_frame_stuff();
 
     if (!doom_rgb_fb) return;  // I_InitGraphics not finished yet
@@ -1090,6 +1103,7 @@ void __not_in_flash_func(doom_hstx_bg_task)(void) {
 #endif
     scanline_func fn = scanline_funcs[display_video_type];
     bool overlays_on = display_video_type >= FIRST_VIDEO_TYPE_WITH_OVERLAYS;
+    doom_bg_rows_done = 0;
     for (int row = 0; row < DOOM_RGB_FB_ROWS; row++) {
         if (fn) {
             fn((uint32_t *)doom_rgb_fb[row], row);
@@ -1099,6 +1113,7 @@ void __not_in_flash_func(doom_hstx_bg_task)(void) {
         if (overlays_on) {
             composite_overlay_scanline(doom_rgb_fb[row], row);
         }
+        doom_bg_rows_done = row + 1;
     }
 }
 
@@ -1115,6 +1130,11 @@ void __not_in_flash_func(doom_hstx_scanline_cb)(uint32_t v_scanline, uint32_t ac
     int src_row = ((int)active_line * DOOM_RGB_FB_ROWS) / 480;
     if (src_row < 0) src_row = 0;
     else if (src_row >= DOOM_RGB_FB_ROWS) src_row = DOOM_RGB_FB_ROWS - 1;
+    if (src_row >= doom_bg_rows_done) {
+        // Beam overtook the bg task's fill: this row still holds last
+        // frame's pixels (tearing). Counted for the 1 Hz "SND" line (br=).
+        doom_bg_race_count++;
+    }
     const uint16_t *src = doom_rgb_fb[src_row];
     for (uint i = 0; i < SCREENWIDTH; i++) {
         uint32_t px = src[i];

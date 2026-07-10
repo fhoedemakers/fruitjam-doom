@@ -1387,6 +1387,7 @@ void OPL_calc_buffer(OPL *opl, int16_t *buffer, uint32_t nsamples) {
 #endif
 #if !LIB_PICO_PLATFORM
 #define __not_in_flash_func(x) x
+#define __scratch_x(group)
 #endif
 
 #if EMU8950_LINEAR
@@ -1724,7 +1725,10 @@ uint32_t __not_in_flash_func(slot_car_linear_alg0)(OPL *opl, OPL_SLOT *slot, uin
 
 static_assert(EMU8950_NO_PERCUSSION_MODE, "");
 // this produces stereo
-void OPL_calc_buffer_linear(OPL *opl, int32_t *buffer, uint32_t nsamples) {
+// SCRATCH_X, not flash: orchestrates the (already RAM-resident) slot
+// renderers; runs every 3 ms from the timer pump on core0. See the matching
+// comment on I_Pico_UpdateSound in i_picosound.c.
+void __scratch_x("snd_mix") OPL_calc_buffer_linear(OPL *opl, int32_t *buffer, uint32_t nsamples) {
     int i;
 #if EMU8950_SLOT_RENDER
     // kind of a nit pick, but so cheap - saves a bug every 24 hours due to an optimization
@@ -1851,7 +1855,7 @@ void OPL_calc_buffer_linear(OPL *opl, int32_t *buffer, uint32_t nsamples) {
 }
 #endif
 
-void OPL_calc_buffer_stereo(OPL *opl, int32_t *buffer, uint32_t nsamples) {
+void __not_in_flash_func(OPL_calc_buffer_stereo)(OPL *opl, int32_t *buffer, uint32_t nsamples) {
     assert(opl->out_step == opl->inp_step);
 #if DUMPO
     bc++;

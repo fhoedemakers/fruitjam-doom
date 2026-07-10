@@ -35,6 +35,10 @@
 #include "opl.h"
 #include "midifile.h"
 
+#if PICO_ON_DEVICE
+#include "pico.h"   // __get_current_exception, for RestartSong's IRQ deferral
+#endif
+
 // #define OPL_MIDI_DEBUG
 
 #define MAXMIDLENGTH (96 * 1024)
@@ -687,7 +691,10 @@ static void I_OPL_SetMusicVolume(int volume)
 
     current_music_volume = volume;
 
-    // Update the volume of all voices.
+    // Update the volume of all voices. Locked: a timer-ISR mix reading the
+    // voice/channel state mid-update would emit stale register writes.
+
+    OPL_Lock();
 
     for (i = 0; i < MIDI_CHANNELS_PER_TRACK; ++i)
     {
@@ -700,6 +707,8 @@ static void I_OPL_SetMusicVolume(int volume)
             SetChannelVolume(&channels[i], channels[i].volume_base, false);
         }
     }
+
+    OPL_Unlock();
 }
 
 static void VoiceKeyOff(opl_voice_t *voice)
@@ -1409,7 +1418,14 @@ uint8_t restart_song_state;
 void RestartSong(void *unused)
 {
 #if DOOM_TINY
-    if (restart_song_state & 1) {
+    if ((restart_song_state & 1)
+#if PICO_ON_DEVICE
+        // The timer-driven audio pump reaches here from IRQ context (as a
+        // queued OPL callback inside the mix); defer for the same stack
+        // reason — the next main-loop mix picks it up.
+        || __get_current_exception()
+#endif
+        ) {
         // need to defer restart of song (because of stack)
         restart_song_state |= 2;
         return;
@@ -1540,6 +1556,11 @@ static void I_OPL_PlaySong(void *handle, boolean looping)
 
     file = handle;
 
+    // Locked: tracks/channels are rebuilt here while the timer-ISR mix may
+    // be walking them via the OPL callback queue.
+
+    OPL_Lock();
+
     // Allocate track data.
 
     tracks = malloc(MIDI_NumTracks(file) * sizeof(opl_track_data_t));
@@ -1572,6 +1593,8 @@ static void I_OPL_PlaySong(void *handle, boolean looping)
     // behavior of the DMX library, and some of the higher-level code in
     // s_sound.c relies on this.
     OPL_SetPaused(0);
+
+    OPL_Unlock();
 }
 
 static void I_OPL_PauseSong(void)
@@ -1583,7 +1606,9 @@ static void I_OPL_PauseSong(void)
         return;
     }
 
-    // Pause OPL callbacks.
+    // Pause OPL callbacks. Locked against the timer-ISR mix.
+
+    OPL_Lock();
 
     OPL_SetPaused(1);
 
@@ -1598,6 +1623,8 @@ static void I_OPL_PauseSong(void)
             VoiceKeyOff(&voices[i]);
         }
     }
+
+    OPL_Unlock();
 }
 
 static void I_OPL_ResumeSong(void)
